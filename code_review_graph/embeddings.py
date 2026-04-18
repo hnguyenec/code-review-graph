@@ -258,9 +258,16 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
     - Azure OpenAI
     - Self-hosted gateways: new-api, LiteLLM, vLLM, LocalAI, Ollama (openai mode)
 
+    Provider identity in ``name`` includes both the model and the endpoint
+    host (``openai:{model}@{host}``), so switching base URL while keeping the
+    same model ID re-partitions the embeddings table and forces a clean
+    re-embed. This is the only defense against silently mixing vector spaces
+    from different backends (e.g. real OpenAI vs. an OpenAI-compatible
+    gateway that ships different weights under the same model name).
+
     Dimension is detected from the first response and frozen; switching the
-    ``model`` in the environment changes ``provider.name``, which forces the
-    embedding store to re-embed (provider-aware isolation in the embeddings table).
+    ``model`` in the environment also changes ``provider.name`` and triggers
+    re-embed via the same isolation key.
     """
 
     _DEFAULT_BATCH_SIZE = 100
@@ -280,9 +287,16 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         self._dimension = dimension
         self._timeout = timeout
         self._batch_size = batch_size or self._DEFAULT_BATCH_SIZE
+        # Normalize the host component for use in provider.name. urlparse
+        # returns netloc as "host[:port]" which is exactly what we want —
+        # distinct endpoints get distinct identities, but `/v1` vs `/v1/`
+        # path variations don't force spurious re-embeds.
+        self._host_key = (urlparse(self._base_url).netloc or self._base_url).lower()
 
     def _call_api(self, texts: list[str]) -> list[list[float]]:
         import json as _json
+        import socket
+        import ssl
         import urllib.error
         import urllib.request
 
@@ -305,7 +319,6 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                import ssl
                 _ssl_ctx = ssl.create_default_context()
                 try:
                     with urllib.request.urlopen(  # nosec B310
@@ -313,9 +326,15 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                     ) as resp:
                         raw = resp.read().decode("utf-8")
                 except urllib.error.HTTPError as http_err:
-                    # Surface the API error body instead of a bare "400 Bad Request" —
-                    # gateways like new-api return JSON with the real reason (batch
-                    # size limits, invalid model, etc.) which is far more actionable.
+                    # 429 / 5xx: re-raise and let the outer retry loop handle it.
+                    # (We must not convert to RuntimeError here or retry below
+                    # can't tell it was a transient HTTP failure.)
+                    if http_err.code == 429 or 500 <= http_err.code < 600:
+                        raise
+                    # Other 4xx: surface the API error body instead of a bare
+                    # "400 Bad Request" — gateways like new-api return JSON
+                    # with the real reason (batch size limits, invalid model,
+                    # etc.) which is far more actionable.
                     try:
                         err_body = http_err.read().decode("utf-8", errors="replace")
                     except Exception:
@@ -347,6 +366,20 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                 data = response.get("data", [])
                 if not data:
                     raise RuntimeError("OpenAI API returned empty data")
+                # OpenAI spec: data[i].index maps to input[i], but some
+                # compatible gateways re-order results or drop entries on
+                # partial failure. Reorder by index and verify the length
+                # so we never zip misaligned vectors onto the wrong nodes.
+                if len(data) != len(texts):
+                    raise RuntimeError(
+                        f"OpenAI API returned {len(data)} embeddings for "
+                        f"{len(texts)} inputs — refusing to misalign vectors."
+                    )
+                try:
+                    data = sorted(data, key=lambda item: int(item.get("index", 0)))
+                except (TypeError, ValueError):
+                    # Some gateways omit index entirely; preserve server order.
+                    pass
 
                 vectors = [item["embedding"] for item in data]
                 if vectors and self._dimension is None:
@@ -354,8 +387,16 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                 return vectors
 
             except Exception as e:
-                err_str = str(e)
-                is_retryable = "429" in err_str or "500" in err_str or "503" in err_str
+                # Retryable = HTTP 429/5xx, network/timeout/TLS issues.
+                # Non-retryable = HTTP 4xx (other), malformed responses,
+                # misaligned data length — those are caller-side bugs that
+                # will keep failing on retry.
+                is_retryable = False
+                if isinstance(e, urllib.error.HTTPError):
+                    is_retryable = e.code == 429 or 500 <= e.code < 600
+                elif isinstance(e, (urllib.error.URLError, socket.timeout,
+                                    TimeoutError, ConnectionError, ssl.SSLError)):
+                    is_retryable = True
                 if not is_retryable or attempt == max_retries - 1:
                     raise
                 wait = 2 ** attempt
@@ -368,6 +409,8 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         return []  # unreachable
 
     def embed(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
         results: list[list[float]] = []
         for i in range(0, len(texts), self._batch_size):
             results.extend(self._call_api(texts[i:i + self._batch_size]))
@@ -385,7 +428,12 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
 
     @property
     def name(self) -> str:
-        return f"openai:{self._model}"
+        # Endpoint-aware identity: model alone is NOT enough — two backends
+        # can serve the same model ID with different weights or dimensions,
+        # and re-using cached embeddings across them silently corrupts
+        # semantic ranking. Including the host partitions the embeddings
+        # table so switching CRG_OPENAI_BASE_URL triggers a safe re-embed.
+        return f"openai:{self._model}@{self._host_key}"
 
 
 CLOUD_PROVIDERS = {"google", "minimax", "openai"}

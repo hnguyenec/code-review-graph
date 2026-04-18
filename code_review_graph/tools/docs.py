@@ -49,13 +49,20 @@ def embed_graph(
     emb_store = EmbeddingStore(db_path, provider=provider, model=model)
     try:
         if not emb_store.available:
-            return {
-                "status": "error",
-                "error": (
-                    "sentence-transformers is not installed. "
-                    "Install with: pip install code-review-graph[embeddings]"
-                ),
-            }
+            if provider in ("openai", "google", "minimax"):
+                err = (
+                    f"The '{provider}' embedding provider is not available. "
+                    "Check the required environment variables "
+                    "(see README and `get_provider()` docstring) and that "
+                    "the endpoint is reachable."
+                )
+            else:
+                err = (
+                    "The local embedding provider needs sentence-transformers. "
+                    "Install with: pip install code-review-graph[embeddings] — "
+                    "or switch provider to 'openai' / 'google' / 'minimax'."
+                )
+            return {"status": "error", "error": err}
 
         newly_embedded = embed_all_nodes(store, emb_store)
         total = emb_store.count()

@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -421,7 +422,7 @@ class TestOpenAIEmbeddingProvider:
         p = OpenAIEmbeddingProvider(
             api_key="k", base_url="http://localhost:3000/v1", model="text-embedding-3-small",
         )
-        assert p.name == "openai:text-embedding-3-small"
+        assert p.name == "openai:text-embedding-3-small@localhost:3000"
 
     def test_default_dimension_before_call(self):
         p = OpenAIEmbeddingProvider(
@@ -560,6 +561,183 @@ class TestOpenAIEmbeddingProvider:
         assert len(out) == 25
         assert call_count["n"] == 3  # 10 + 10 + 5
 
+    def test_empty_input_returns_empty(self):
+        """embed([]) must short-circuit without hitting the API."""
+        p = OpenAIEmbeddingProvider(
+            api_key="k", base_url="http://localhost:3000/v1", model="m",
+        )
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            assert p.embed([]) == []
+            mock_urlopen.assert_not_called()
+
+    def test_endpoint_isolation_in_name(self):
+        """Two providers with the same model but different base URLs MUST
+        produce different provider.name values, otherwise the embeddings
+        store silently reuses vectors from a different backend's vector space.
+        (Codex review HIGH finding.)"""
+        p1 = OpenAIEmbeddingProvider(
+            api_key="k", base_url="https://api.openai.com/v1",
+            model="text-embedding-3-small",
+        )
+        p2 = OpenAIEmbeddingProvider(
+            api_key="k", base_url="https://openrouter.ai/api/v1",
+            model="text-embedding-3-small",
+        )
+        p3 = OpenAIEmbeddingProvider(
+            api_key="k", base_url="http://127.0.0.1:3000/v1",
+            model="text-embedding-3-small",
+        )
+        assert p1.name != p2.name != p3.name
+        assert p1.name == "openai:text-embedding-3-small@api.openai.com"
+        assert p2.name == "openai:text-embedding-3-small@openrouter.ai"
+        assert p3.name == "openai:text-embedding-3-small@127.0.0.1:3000"
+
+    def test_trailing_slash_does_not_change_identity(self):
+        """A trailing slash on base_url must not cause a re-embed."""
+        p1 = OpenAIEmbeddingProvider(
+            api_key="k", base_url="http://localhost:3000/v1", model="m",
+        )
+        p2 = OpenAIEmbeddingProvider(
+            api_key="k", base_url="http://localhost:3000/v1/", model="m",
+        )
+        assert p1.name == p2.name
+
+    def test_response_length_mismatch_raises(self):
+        """Gateway returns fewer embeddings than inputs: refuse to proceed
+        rather than silently zip misaligned vectors onto the wrong nodes.
+        (Codex review MED finding.)"""
+        p = OpenAIEmbeddingProvider(
+            api_key="k", base_url="http://localhost:3000/v1", model="m",
+        )
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_make_openai_response([[0.1] * 5]),  # 1 vec
+        ):
+            with pytest.raises(RuntimeError, match="refusing to misalign"):
+                p.embed(["a", "b", "c"])  # 3 inputs
+
+    def test_reordered_response_is_sorted_by_index(self):
+        """Gateway returns data out of order: restore input order via
+        the `index` field, so vec[i] always corresponds to input[i].
+        (Codex review MED finding.)"""
+        p = OpenAIEmbeddingProvider(
+            api_key="k", base_url="http://localhost:3000/v1", model="m",
+        )
+        # Return data in order 2, 0, 1 (i.e. reversed-ish).
+        reordered = json.dumps({
+            "data": [
+                {"embedding": [3.0], "index": 2},
+                {"embedding": [1.0], "index": 0},
+                {"embedding": [2.0], "index": 1},
+            ],
+        }).encode("utf-8")
+        mock = MagicMock()
+        mock.read.return_value = reordered
+        mock.__enter__ = MagicMock(return_value=mock)
+        mock.__exit__ = MagicMock(return_value=False)
+        with patch("urllib.request.urlopen", return_value=mock):
+            result = p.embed(["a", "b", "c"])
+        # Must be [[1.0], [2.0], [3.0]] after sorting by index.
+        assert result == [[1.0], [2.0], [3.0]]
+
+    def test_retry_on_http_429(self, monkeypatch):
+        """HTTP 429 must trigger retry with backoff (not bail immediately).
+        (Codex review MED finding — prior substring match missed the fact
+        that error bodies may not contain '429'.)"""
+        import urllib.error
+        monkeypatch.setattr(time, "sleep", lambda s: None)  # instant retries
+
+        p = OpenAIEmbeddingProvider(
+            api_key="k", base_url="http://localhost:3000/v1", model="m",
+        )
+        call_count = {"n": 0}
+        good_response = _make_openai_response([[0.1] * 5])
+        import io
+
+        def _mock_urlopen(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise urllib.error.HTTPError(
+                    url="http://localhost:3000/v1/embeddings",
+                    code=429, msg="Too Many Requests", hdrs=None,
+                    fp=io.BytesIO(b'{"error": "rate limited"}'),
+                )
+            return good_response
+
+        with patch("urllib.request.urlopen", side_effect=_mock_urlopen):
+            out = p.embed_query("x")
+        assert len(out) == 5
+        assert call_count["n"] == 2  # 1 fail + 1 success
+
+    def test_retry_on_socket_timeout(self, monkeypatch):
+        """socket.timeout (read timeout) must be classified retryable —
+        previously these surfaced as str(exc) without '429/500/503' so
+        retry never fired. (Codex review MED finding.)"""
+        import socket
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+
+        p = OpenAIEmbeddingProvider(
+            api_key="k", base_url="http://localhost:3000/v1", model="m",
+        )
+        call_count = {"n": 0}
+        good_response = _make_openai_response([[0.1] * 5])
+
+        def _mock_urlopen(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] <= 2:
+                raise socket.timeout("read timed out")
+            return good_response
+
+        with patch("urllib.request.urlopen", side_effect=_mock_urlopen):
+            out = p.embed_query("x")
+        assert len(out) == 5
+        assert call_count["n"] == 3  # 2 fails + 1 success
+
+    def test_retry_on_url_error(self, monkeypatch):
+        """URLError (connection refused, DNS failure) must retry."""
+        import urllib.error
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+
+        p = OpenAIEmbeddingProvider(
+            api_key="k", base_url="http://localhost:3000/v1", model="m",
+        )
+        call_count = {"n": 0}
+
+        def _mock_urlopen(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise urllib.error.URLError("connection refused")
+            return _make_openai_response([[0.1] * 5])
+
+        with patch("urllib.request.urlopen", side_effect=_mock_urlopen):
+            p.embed_query("x")
+        assert call_count["n"] == 2
+
+    def test_no_retry_on_http_400(self, monkeypatch):
+        """HTTP 400 = caller bug (bad payload, unsupported model). Must fail
+        fast rather than waste time on 3 retries."""
+        import io
+        import urllib.error
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+
+        p = OpenAIEmbeddingProvider(
+            api_key="k", base_url="http://localhost:3000/v1", model="m",
+        )
+        call_count = {"n": 0}
+
+        def _mock_urlopen(*args, **kwargs):
+            call_count["n"] += 1
+            raise urllib.error.HTTPError(
+                url="http://localhost:3000/v1/embeddings",
+                code=400, msg="Bad Request", hdrs=None,
+                fp=io.BytesIO(b'{"error": {"message": "invalid model"}}'),
+            )
+
+        with patch("urllib.request.urlopen", side_effect=_mock_urlopen):
+            with pytest.raises(RuntimeError, match="invalid model"):
+                p.embed_query("x")
+        assert call_count["n"] == 1  # no retry on 4xx non-429
+
     def test_http_error_body_is_surfaced(self):
         """If the gateway returns 400 with a JSON error body, the RuntimeError
         must include the real reason, not just 'HTTP Error 400: Bad Request'."""
@@ -592,7 +770,7 @@ class TestGetProviderOpenAI:
         with patch.dict("os.environ", self._MIN_ENV, clear=True):
             p = get_provider("openai")
         assert isinstance(p, OpenAIEmbeddingProvider)
-        assert p.name == "openai:text-embedding-3-small"
+        assert p.name == "openai:text-embedding-3-small@127.0.0.1:3000"
 
     def test_missing_api_key_raises(self):
         env = {k: v for k, v in self._MIN_ENV.items() if k != "CRG_OPENAI_API_KEY"}
@@ -615,7 +793,7 @@ class TestGetProviderOpenAI:
     def test_model_arg_overrides_env(self):
         with patch.dict("os.environ", self._MIN_ENV, clear=True):
             p = get_provider("openai", model="text-embedding-3-large")
-        assert p.name == "openai:text-embedding-3-large"
+        assert p.name == "openai:text-embedding-3-large@127.0.0.1:3000"
 
     def test_dimension_env_forwarded(self):
         env = {**self._MIN_ENV, "CRG_OPENAI_DIMENSION": "256"}
