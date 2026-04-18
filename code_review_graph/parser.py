@@ -108,6 +108,7 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".sh": "bash",
     ".bash": "bash",
     ".zsh": "bash",
+    ".ksh": "bash",  # Korn shell — close enough to bash for tree-sitter-bash (#235)
     ".ex": "elixir",
     ".exs": "elixir",
     ".ipynb": "notebook",
@@ -117,7 +118,43 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".psd1": "powershell",
     ".svelte": "svelte",
     ".jl": "julia",
+    ".gd": "gdscript",
 }
+
+# Shebang interpreter → language mapping for extension-less Unix scripts.
+# Each key is the **basename** of the interpreter path as it appears after
+# ``#!`` (or after ``#!/usr/bin/env``).  Only languages already registered
+# above are listed — this file strictly routes extension-less scripts, it
+# does NOT introduce new languages on its own.  See issue #237.
+SHEBANG_INTERPRETER_TO_LANGUAGE: dict[str, str] = {
+    # POSIX / bash-compatible shells — all routed through tree-sitter-bash
+    "bash": "bash",
+    "sh": "bash",
+    "zsh": "bash",
+    "ksh": "bash",
+    "dash": "bash",
+    "ash": "bash",
+    # Python (every common variant)
+    "python": "python",
+    "python2": "python",
+    "python3": "python",
+    "pypy": "python",
+    "pypy3": "python",
+    # JavaScript via Node
+    "node": "javascript",
+    "nodejs": "javascript",
+    # Ruby / Perl / Lua / R / PHP
+    "ruby": "ruby",
+    "perl": "perl",
+    "lua": "lua",
+    "Rscript": "r",
+    "php": "php",
+}
+
+# Maximum bytes to read from the head of a file when probing for a shebang.
+# 256 is enough for any reasonable shebang line (``#!/usr/bin/env python3 -u\n``
+# is ~30 chars) while keeping the worst-case read tiny even on fat binaries.
+_SHEBANG_PROBE_BYTES = 256
 
 # Tree-sitter node type mappings per language
 # Maps (language) -> dict of semantic role -> list of TS node types
@@ -164,6 +201,9 @@ _CLASS_TYPES: dict[str, list[str]] = {
     "zig": ["container_declaration"],
     "powershell": ["class_statement"],
     "julia": ["struct_definition", "abstract_definition"],
+    # GDScript: inner classes use ``class Name:`` (class_definition); the
+    # file-level ``class_name Name`` gives the script itself an identity.
+    "gdscript": ["class_definition", "class_name_statement"],
 }
 
 _FUNCTION_TYPES: dict[str, list[str]] = {
@@ -214,6 +254,8 @@ _FUNCTION_TYPES: dict[str, list[str]] = {
         "function_definition",
         "short_function_definition",
     ],
+    # GDScript: ``func name(args) -> ReturnType:`` — includes ``static func``.
+    "gdscript": ["function_definition"],
 }
 
 _IMPORT_TYPES: dict[str, list[str]] = {
@@ -254,6 +296,11 @@ _IMPORT_TYPES: dict[str, list[str]] = {
     "powershell": [],
     # Julia: import/using are import_statement nodes.
     "julia": ["import_statement", "using_statement"],
+    # GDScript has no ``import`` keyword. The closest analogue is
+    # ``extends OtherClass`` / ``extends "res://path.gd"``, which establishes
+    # a hard dependency on the parent script. preload()/load() calls remain
+    # as ordinary CALLS edges.
+    "gdscript": ["extends_statement"],
 }
 
 _CALL_TYPES: dict[str, list[str]] = {
@@ -275,7 +322,12 @@ _CALL_TYPES: dict[str, list[str]] = {
     ],
     "kotlin": ["call_expression"],
     "swift": ["call_expression"],
-    "php": ["function_call_expression", "member_call_expression"],
+    "php": [
+        "function_call_expression",
+        "member_call_expression",
+        "scoped_call_expression",
+        "nullsafe_member_call_expression",
+    ],
     "scala": ["call_expression", "instance_expression", "generic_function"],
     "solidity": ["call_expression"],
     "lua": ["function_call"],
@@ -292,6 +344,9 @@ _CALL_TYPES: dict[str, list[str]] = {
     "zig": ["call_expression", "builtin_call_expr"],
     "powershell": ["command_expression"],
     "julia": ["call_expression"],
+    # GDScript: bare calls produce ``call``; ``obj.method()`` is an
+    # ``attribute`` node whose right-hand side is an ``attribute_call``.
+    "gdscript": ["call", "attribute_call"],
 }
 
 # Patterns that indicate a test function
@@ -383,7 +438,88 @@ class CodeParser:
         return self._parsers[language]
 
     def detect_language(self, path: Path) -> Optional[str]:
-        return EXTENSION_TO_LANGUAGE.get(path.suffix.lower())
+        """Map a file path to its language name.
+
+        Extension-based lookup is tried first.  For extension-less files
+        (typical for Unix scripts like ``bin/myapp`` or ``.git/hooks/pre-commit``)
+        we fall back to reading the first line for a shebang.  Files that
+        already have a known extension are never re-read — shebang probing
+        only runs when the extension lookup returns ``None`` **and** the path
+        has no suffix at all.  See issue #237.
+        """
+        suffix = path.suffix.lower()
+        lang = EXTENSION_TO_LANGUAGE.get(suffix)
+        if lang is not None:
+            return lang
+        # Only probe shebang for files without any extension — "README", "LICENSE",
+        # and other extension-less text files also fall here, but the probe is a
+        # cheap 256-byte read that returns None when no shebang is found.
+        if suffix == "":
+            return self._detect_language_from_shebang(path)
+        return None
+
+    @staticmethod
+    def _detect_language_from_shebang(path: Path) -> Optional[str]:
+        """Inspect the first line of ``path`` for a shebang interpreter.
+
+        Returns the mapped language name or ``None`` if the file has no
+        shebang, is unreadable, or names an interpreter we don't map.
+
+        Accepted shapes::
+
+            #!/bin/bash
+            #!/usr/bin/env python3
+            #!/usr/bin/env -S node --experimental-vm-modules
+            #!/usr/bin/bash -e
+
+        Only the basename of the interpreter is consulted.  Trailing flags
+        after the interpreter are ignored.  Windows-style ``\r\n`` line
+        endings are handled.  Binary files read as garbage bytes simply
+        fail the ``#!`` prefix check and return ``None``.
+        """
+        try:
+            with path.open("rb") as fh:
+                head = fh.read(_SHEBANG_PROBE_BYTES)
+        except (OSError, PermissionError):
+            return None
+        if not head.startswith(b"#!"):
+            return None
+
+        # Take just the first line, stripped of leading "#!" and any
+        # surrounding whitespace.  Split on NUL to defend against accidental
+        # binary content following a ``#!`` prefix.
+        first_line = head.split(b"\n", 1)[0].split(b"\0", 1)[0]
+        try:
+            line = first_line[2:].decode("utf-8", errors="strict").strip()
+        except UnicodeDecodeError:
+            return None
+        if not line:
+            return None
+
+        tokens = line.split()
+        if not tokens:
+            return None
+
+        first = tokens[0]
+        # `/usr/bin/env` indirection: the interpreter is the next token.
+        # `/usr/bin/env -S node --flag` is also valid — skip any leading
+        # ``-`` options after env.
+        if first.endswith("/env") or first == "env":
+            interpreter_token: Optional[str] = None
+            for tok in tokens[1:]:
+                if tok.startswith("-"):
+                    # ``-S`` takes no argument in most envs; skip and continue.
+                    continue
+                interpreter_token = tok
+                break
+            if interpreter_token is None:
+                return None
+            interpreter = interpreter_token.rsplit("/", 1)[-1]
+        else:
+            # Direct form: ``#!/bin/bash`` or ``#!/usr/local/bin/python3``.
+            interpreter = first.rsplit("/", 1)[-1]
+
+        return SHEBANG_INTERPRETER_TO_LANGUAGE.get(interpreter)
 
     def parse_file(self, path: Path) -> tuple[list[NodeInfo], list[EdgeInfo]]:
         """Parse a single file and return extracted nodes and edges."""
@@ -415,11 +551,20 @@ class CodeParser:
         if language == "notebook":
             return self._parse_notebook(path, source)
 
-        # Databricks .py notebook exports
-        if language == "python" and source.startswith(
-            b"# Databricks notebook source\n",
-        ):
-            return self._parse_databricks_py_notebook(path, source)
+        # Databricks .py notebook exports.  The header is ALWAYS the very
+        # first line, but the file may have CRLF line endings on Windows
+        # (git's core.autocrlf=true default).  Match the first line robustly
+        # after stripping any trailing ``\r`` so the detection works on both
+        # platforms.  See issue #239.
+        if language == "python":
+            first_newline = source.find(b"\n")
+            first_line = (
+                source[:first_newline].rstrip(b"\r")
+                if first_newline != -1
+                else source.rstrip(b"\r")
+            )
+            if first_line == b"# Databricks notebook source":
+                return self._parse_databricks_py_notebook(path, source)
 
         parser = self._get_parser(language)
         if not parser:
@@ -1450,26 +1595,27 @@ class CodeParser:
             return True
 
         # ---- Everything else = a regular function/method call ----------
-        # Emit a CALLS edge when we're inside a function (same rule as
-        # the generic _extract_calls path).
-        if enclosing_func:
-            # For dotted calls like `IO.puts(msg)`, prefer the dotted
-            # identifier; for bare calls use the first identifier.
-            call_name = ident
-            caller = self._qualify(
-                enclosing_func, file_path, enclosing_class,
-            )
-            target = self._resolve_call_target(
-                call_name, file_path, language,
-                import_map or {}, defined_names or set(),
-            )
-            edges.append(EdgeInfo(
-                kind="CALLS",
-                source=caller,
-                target=target,
-                file_path=file_path,
-                line=node.start_point[0] + 1,
-            ))
+        # Module-scope calls attribute to the File node (same rule as the
+        # generic _extract_calls path).
+        # For dotted calls like `IO.puts(msg)`, prefer the dotted
+        # identifier; for bare calls use the first identifier.
+        call_name = ident
+        caller = (
+            self._qualify(enclosing_func, file_path, enclosing_class)
+            if enclosing_func
+            else file_path
+        )
+        target = self._resolve_call_target(
+            call_name, file_path, language,
+            import_map or {}, defined_names or set(),
+        )
+        edges.append(EdgeInfo(
+            kind="CALLS",
+            source=caller,
+            target=target,
+            file_path=file_path,
+            line=node.start_point[0] + 1,
+        ))
         # Recurse into arguments + do_block so nested calls are caught.
         for sub in node.children:
             if sub.type in ("arguments", "do_block"):
@@ -2376,9 +2522,17 @@ class CodeParser:
             )
             return True
 
-        if call_name and enclosing_func:
-            caller = self._qualify(
-                enclosing_func, file_path, enclosing_class,
+        if call_name:
+            # Module-scope calls (no enclosing function) are attributed to
+            # the File node. Matches the existing convention for CONTAINS
+            # edges and _extract_value_references. Without this fallback,
+            # any function called only from top-level script glue, CLI
+            # entrypoints, or Jupyter/Databricks notebook cells is flagged
+            # as dead by find_dead_code.
+            caller = (
+                self._qualify(enclosing_func, file_path, enclosing_class)
+                if enclosing_func
+                else file_path
             )
             target = self._resolve_call_target(
                 call_name, file_path, language,
@@ -2411,17 +2565,21 @@ class CodeParser:
         Treat uppercase component tags such as ``<MarkdownMsg />`` as call-like
         edges so caller/impact queries can cross the JSX boundary. Intrinsic DOM
         tags (``<div>``) are ignored.
-        """
-        if not enclosing_func:
-            return
 
+        Module-scope JSX (e.g. a top-level ``<App />`` render call) attributes
+        to the File node.
+        """
         target = self._resolve_jsx_component_target(
             child, language, file_path, import_map or {}, defined_names or set(),
         )
         if not target:
             return
 
-        caller = self._qualify(enclosing_func, file_path, enclosing_class)
+        caller = (
+            self._qualify(enclosing_func, file_path, enclosing_class)
+            if enclosing_func
+            else file_path
+        )
         edges.append(EdgeInfo(
             kind="CALLS",
             source=caller,
@@ -2702,15 +2860,20 @@ class CodeParser:
         Returns True if the child was fully handled and should skip
         default recursion.
         """
-        # Emit statements: emit EventName(...) -> CALLS edge
-        if node_type == "emit_statement" and enclosing_func:
+        # Emit statements: emit EventName(...) -> CALLS edge.
+        # Module-scope emits attribute to the File node.
+        if node_type == "emit_statement":
             for sub in child.children:
                 if sub.type == "expression":
                     for ident in sub.children:
                         if ident.type == "identifier":
-                            caller = self._qualify(
-                                enclosing_func, file_path,
-                                enclosing_class,
+                            caller = (
+                                self._qualify(
+                                    enclosing_func, file_path,
+                                    enclosing_class,
+                                )
+                                if enclosing_func
+                                else file_path
                             )
                             edges.append(EdgeInfo(
                                 kind="CALLS",
@@ -3108,6 +3271,38 @@ class CodeParser:
             # ``dart:core`` / ``dart:async`` etc. are SDK libraries we do
             # not track; fall through to return None.
 
+        elif language == "java":
+            # ``import com.example.pkg.ClassName;`` — convert dot-notation
+            # to a relative path and walk up from the caller's directory to
+            # find the source root.  Wildcards (``import pkg.*``) and static
+            # member imports (``import static pkg.Class.member``) that don't
+            # resolve as-is are retried after dropping the last segment
+            # (the member name).
+            if module.endswith(".*"):
+                return None  # wildcard import — can't resolve to one file
+            rel_path = module.replace(".", "/") + ".java"
+            current = caller_dir
+            while True:
+                target = current / rel_path
+                if target.is_file():
+                    return str(target.resolve())
+                if current == current.parent:
+                    break
+                current = current.parent
+            # Static import: ``pkg.Class.member`` — strip member, try again
+            dot = module.rfind(".")
+            if dot > 0:
+                class_module = module[:dot]
+                rel_path2 = class_module.replace(".", "/") + ".java"
+                current = caller_dir
+                while True:
+                    target = current / rel_path2
+                    if target.is_file():
+                        return str(target.resolve())
+                    if current == current.parent:
+                        break
+                    current = current.parent
+
         return None
 
     def _find_dart_pubspec_root(
@@ -3357,6 +3552,16 @@ class CodeParser:
             for child in node.children:
                 if child.type == "field_identifier":
                     return child.text.decode("utf-8", errors="replace")
+        # Java methods: tree-sitter-java puts type_identifier or generic_type
+        # (return type) before identifier (method name).  Must run before
+        # the generic loop, which would match the return type's
+        # type_identifier (e.g. "String", "ConfigBean").
+        # Constructors are fine — they have no return type node.
+        # Kotlin is unaffected: its syntax places the name before the type.
+        if language == "java" and node.type == "method_declaration":
+            for child in node.children:
+                if child.type == "identifier":
+                    return child.text.decode("utf-8", errors="replace")
         # Swift extensions: name is inside user_type > type_identifier
         # (e.g. `extension MyClass: Protocol { ... }`)
         if language == "swift" and node.type == "class_declaration":
@@ -3450,7 +3655,23 @@ class CodeParser:
                     for arg in child.children:
                         if arg.type in ("identifier", "attribute"):
                             bases.append(arg.text.decode("utf-8", errors="replace"))
-        elif language in ("java", "csharp", "kotlin"):
+        elif language == "java":
+            # Java: superclass and super_interfaces wrap the keyword
+            # (extends/implements) around type_identifier children.
+            # Taking .text would include the keyword (e.g. "implements Foo").
+            # Drill into the children to extract bare type names.
+            for child in node.children:
+                if child.type == "superclass":
+                    for sub in child.children:
+                        if sub.type in ("type_identifier", "generic_type"):
+                            bases.append(sub.text.decode("utf-8", errors="replace"))
+                elif child.type == "super_interfaces":
+                    for sub in child.children:
+                        if sub.type == "type_list":
+                            for ident in sub.children:
+                                if ident.type in ("type_identifier", "generic_type"):
+                                    bases.append(ident.text.decode("utf-8", errors="replace"))
+        elif language in ("csharp", "kotlin"):
             # Look for superclass/interfaces in extends/implements clauses
             for child in node.children:
                 if child.type in (
@@ -3650,6 +3871,25 @@ class CodeParser:
             val = _find_string_literal(node)
             if val:
                 imports.append(val)
+        elif language == "gdscript":
+            # ``extends Node`` → type > identifier("Node")
+            # ``extends "res://path.gd"`` → string literal
+            # ``extends SomeClass.Nested`` → type node (keep full text)
+            for child in node.children:
+                if child.type == "type":
+                    txt = child.text.decode("utf-8", errors="replace").strip()
+                    if txt:
+                        imports.append(txt)
+                elif child.type == "string":
+                    val = child.text.decode("utf-8", errors="replace").strip("'\"")
+                    if val:
+                        imports.append(val)
+                elif child.type == "identifier":
+                    # Fallback: some grammar variants expose the parent type as
+                    # a bare identifier next to the ``extends`` keyword.
+                    txt = child.text.decode("utf-8", errors="replace")
+                    if txt and txt != "extends":
+                        imports.append(txt)
         else:
             # Fallback: just record the text
             imports.append(text)
@@ -3662,6 +3902,39 @@ class CodeParser:
             return None
 
         first = node.children[0]
+
+        if language == "php":
+            def _normalize_php_name(text: str) -> str:
+                # PHP global/function names can be prefixed with '\\'.
+                return text.lstrip("\\")
+
+            if node.type == "function_call_expression":
+                for child in node.children:
+                    if child.type in ("name", "qualified_name"):
+                        raw = child.text.decode("utf-8", errors="replace")
+                        return _normalize_php_name(raw)
+                return None
+
+            if node.type in (
+                "member_call_expression",
+                "nullsafe_member_call_expression",
+            ):
+                for child in reversed(node.children):
+                    if child.type == "name":
+                        return child.text.decode("utf-8", errors="replace")
+                return None
+
+            if node.type == "scoped_call_expression":
+                parts = []
+                for child in node.children:
+                    if child.type in ("name", "qualified_name"):
+                        raw = child.text.decode("utf-8", errors="replace")
+                        parts.append(_normalize_php_name(raw))
+                if len(parts) >= 2:
+                    return f"{parts[0]}::{parts[-1]}"
+                if parts:
+                    return parts[0]
+                return None
 
         # Scala: instance_expression (new Foo(...)) – extract the type name
         if node.type == "instance_expression":
@@ -3999,21 +4272,25 @@ class CodeParser:
                 import_map, defined_names,
             )
 
-        if enclosing_func:
-            call_name = self._get_call_name(node, language, source)
-            if call_name:
-                caller = self._qualify(enclosing_func, file_path, enclosing_class)
-                target = self._resolve_call_target(
-                    call_name, file_path, language,
-                    import_map or {}, defined_names or set(),
-                )
-                edges.append(EdgeInfo(
-                    kind="CALLS",
-                    source=caller,
-                    target=target,
-                    file_path=file_path,
-                    line=node.start_point[0] + 1,
-                ))
+        # Module-scope R calls attribute to the File node.
+        call_name = self._get_call_name(node, language, source)
+        if call_name:
+            caller = (
+                self._qualify(enclosing_func, file_path, enclosing_class)
+                if enclosing_func
+                else file_path
+            )
+            target = self._resolve_call_target(
+                call_name, file_path, language,
+                import_map or {}, defined_names or set(),
+            )
+            edges.append(EdgeInfo(
+                kind="CALLS",
+                source=caller,
+                target=target,
+                file_path=file_path,
+                line=node.start_point[0] + 1,
+            ))
 
         self._extract_from_tree(
             node, source, language, file_path, nodes, edges,
